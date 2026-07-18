@@ -1,0 +1,16 @@
+{
+  "name": "yahoo-auto-login",
+  "version": "1.0.0",
+  "description": "Yahoo HTTP auto login without browser (cuimp)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "login": "node index.js"
+  },
+  "dependencies": {
+    "cuimp": "^2.0.2"
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}
